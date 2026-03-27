@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/vadstup/Projects/personal/x-transformers/*.py)"
+    ]
+  }
+}
