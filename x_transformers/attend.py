@@ -307,13 +307,7 @@ class Attend(Module):
 
         if self.flash:
             if self.flash_pack_seq:
-                try:
-                    from flash_attn import flash_attn_varlen_func
-                    self.flash_attn_varlen_func = flash_attn_varlen_func
-                except ImportError:
-                    raise ImportError("block masking with Flash Attention requires the flash-attn package. Please install it with `pip install flash-attn`.")
-                major, minor = torch.cuda.get_device_capability()
-                assert major >= 8, f"block masking with Flash Attention requires SM80+ (Ampere or newer) GPUs, but your GPU has SM{major}{minor}."
+                assert torch_version >= version.parse('2.5.0'), 'flash_pack_seq requires PyTorch 2.5 or above for flex_attention support'
 
             # torch 2.3 uses new backend and context manager
             if torch_version >= version.parse('2.3'):
@@ -337,7 +331,7 @@ class Attend(Module):
         q, k, v,
         mask = None,
         attn_bias = None,
-        flash_pack_seq_kwargs = None, # https://github.com/Dao-AILab/flash-attention/blob/v2.8.3/flash_attn/flash_attn_interface.py#L1370
+        flash_pack_seq_kwargs = None,
         causal = None,
     ):
         batch, heads, q_len, _, k_len, is_cuda, device = *q.shape, k.shape[-2], q.is_cuda, q.device
@@ -441,16 +435,34 @@ class Attend(Module):
             assert not exists(mask) and exists(cu_seqlens_q) and exists(cu_seqlens_k), "mask cannot be passed with cu_seqlens for block masking"
             assert cu_seqlens_q.shape == cu_seqlens_k.shape and cu_seqlens_q.ndim == 1 and not cu_seqlens_q.is_floating_point() and not cu_seqlens_k.is_floating_point() and (cu_seqlens_q.diff() > 0).all() and (cu_seqlens_k.diff() > 0).all(), "cu_seqlens_q/k should be same-length 1D cumulative sequence lengths for block masking"
             assert not causal or (cu_seqlens_q == cu_seqlens_k).all(), "causal attention with different cu_seqlens for q and k not supported"
-            # efficient packed sequences flash attentino masking
-            att = self.flash_attn_varlen_func(
-                q = rearrange(q, '1 h t d ->t h d'),
-                k = rearrange(k, '1 h t d ->t h d'),
-                v = rearrange(v, '1 h t d ->t h d'),
-                causal=causal,
-                dropout_p=self.dropout if self.training else 0.,
-                **flash_pack_seq_kwargs
+
+            from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+            # Build token-to-segment id tensors via searchsorted on cumulative lengths
+            total_q = cu_seqlens_q[-1].item()
+            total_k = cu_seqlens_k[-1].item()
+            q_segment_ids = torch.searchsorted(cu_seqlens_q, torch.arange(total_q, device=device), right=True) - 1
+            k_segment_ids = torch.searchsorted(cu_seqlens_k, torch.arange(total_k, device=device), right=True) - 1
+
+            def make_mask_mod(_q_seg, _k_seg, _causal):
+                def mask_mod(b, h, q_idx, kv_idx):
+                    same_segment = _q_seg[q_idx] == _k_seg[kv_idx]
+                    return same_segment & (q_idx >= kv_idx) if _causal else same_segment
+                return mask_mod
+
+            block_mask = create_block_mask(
+                make_mask_mod(q_segment_ids, k_segment_ids, causal),
+                B=None, H=None, Q_LEN=total_q, KV_LEN=total_k,
+                device=device
             )
-            out = rearrange(att, 't h d -> 1 h t d')
+
+            # flex_attention applies its own 1/sqrt(head_dim) scale; q is already
+            # pre-scaled by (self.scale / default_scale) if a custom scale was set,
+            # so the effective scale is self.scale — same behaviour as before.
+            out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=(k.shape[1] < q.shape[1]))
+
+            if self.training and self.dropout > 0.:
+                out = F.dropout(out, p=self.dropout)
         else:
             with self.sdp_context_manager():
                 out = F.scaled_dot_product_attention(
