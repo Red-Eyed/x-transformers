@@ -150,6 +150,38 @@ def sparse_topk_attn(
     soft_attn = (orig_logits / temperature).softmax(dim = -1)
     return topk_attn.detach() + soft_attn - soft_attn.detach()
 
+# variable-length attention helpers
+
+def varlen_attn_cuda(q, k, v, cu_seqlens_q, cu_seqlens_k, causal):
+    from torch.nn.attention.varlen import varlen_attn
+    max_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max())
+    max_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max())
+    window_size = (-1, 0) if causal else (-1, -1)
+    att = varlen_attn(
+        query    = rearrange(q, '1 h t d -> t h d'),
+        key      = rearrange(k, '1 h t d -> t h d'),
+        value    = rearrange(v, '1 h t d -> t h d'),
+        cu_seq_q = cu_seqlens_q,
+        cu_seq_k = cu_seqlens_k,
+        max_q    = max_q,
+        max_k    = max_k,
+        window_size = window_size,
+    )
+    return rearrange(att, 't h d -> 1 h t d')
+
+def varlen_attn_cpu(q, k, v, cu_seqlens_q, cu_seqlens_k, causal):
+    device = q.device
+    total_q = cu_seqlens_q[-1].item()
+    total_k = cu_seqlens_k[-1].item()
+    q_idx = torch.arange(total_q, device=device)
+    k_idx = torch.arange(total_k, device=device)
+    q_seg = torch.searchsorted(cu_seqlens_q.to(device), q_idx, right=True) - 1
+    k_seg = torch.searchsorted(cu_seqlens_k.to(device), k_idx, right=True) - 1
+    mask = q_seg.unsqueeze(1) == k_seg.unsqueeze(0)
+    if causal:
+        mask = mask & (q_idx.unsqueeze(1) >= k_idx.unsqueeze(0))
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
 # functions for creating causal mask
 # need a special one for onnx cpu (no support for .triu)
 
@@ -436,26 +468,8 @@ class Attend(Module):
             assert cu_seqlens_q.shape == cu_seqlens_k.shape and cu_seqlens_q.ndim == 1 and not cu_seqlens_q.is_floating_point() and not cu_seqlens_k.is_floating_point() and (cu_seqlens_q.diff() > 0).all() and (cu_seqlens_k.diff() > 0).all(), "cu_seqlens_q/k should be same-length 1D cumulative sequence lengths for block masking"
             assert not causal or (cu_seqlens_q == cu_seqlens_k).all(), "causal attention with different cu_seqlens for q and k not supported"
 
-            from torch.nn.attention.varlen import varlen_attn
-
-            max_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max())
-            max_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max())
-            window_size = (-1, 0) if causal else (-1, -1)
-
-            # q is already pre-scaled by (self.scale / default_scale) if a custom scale
-            # was set; varlen_attn applies its own 1/sqrt(head_dim), giving effective
-            # scale = self.scale — same behaviour as the sdp path.
-            att = varlen_attn(
-                query = rearrange(q, '1 h t d -> t h d'),
-                key   = rearrange(k, '1 h t d -> t h d'),
-                value = rearrange(v, '1 h t d -> t h d'),
-                cu_seq_q = cu_seqlens_q,
-                cu_seq_k = cu_seqlens_k,
-                max_q = max_q,
-                max_k = max_k,
-                window_size = window_size,
-            )
-            out = rearrange(att, 't h d -> 1 h t d')
+            varlen_fn = varlen_attn_cuda if is_cuda else varlen_attn_cpu
+            out = varlen_fn(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
 
             if self.training and self.dropout > 0.:
                 out = F.dropout(out, p=self.dropout)
