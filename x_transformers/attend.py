@@ -307,7 +307,7 @@ class Attend(Module):
 
         if self.flash:
             if self.flash_pack_seq:
-                assert torch_version >= version.parse('2.5.0'), 'flash_pack_seq requires PyTorch 2.5 or above for flex_attention support'
+                assert torch_version >= version.parse('2.6.0'), 'flash_pack_seq requires PyTorch 2.6 or above for torch.nn.attention.varlen support'
 
             # torch 2.3 uses new backend and context manager
             if torch_version >= version.parse('2.3'):
@@ -436,30 +436,26 @@ class Attend(Module):
             assert cu_seqlens_q.shape == cu_seqlens_k.shape and cu_seqlens_q.ndim == 1 and not cu_seqlens_q.is_floating_point() and not cu_seqlens_k.is_floating_point() and (cu_seqlens_q.diff() > 0).all() and (cu_seqlens_k.diff() > 0).all(), "cu_seqlens_q/k should be same-length 1D cumulative sequence lengths for block masking"
             assert not causal or (cu_seqlens_q == cu_seqlens_k).all(), "causal attention with different cu_seqlens for q and k not supported"
 
-            from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+            from torch.nn.attention.varlen import varlen_attn
 
-            # Build token-to-segment id tensors via searchsorted on cumulative lengths
-            total_q = cu_seqlens_q[-1].item()
-            total_k = cu_seqlens_k[-1].item()
-            q_segment_ids = torch.searchsorted(cu_seqlens_q, torch.arange(total_q, device=device), right=True) - 1
-            k_segment_ids = torch.searchsorted(cu_seqlens_k, torch.arange(total_k, device=device), right=True) - 1
+            max_q = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max())
+            max_k = int((cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max())
+            window_size = (-1, 0) if causal else (-1, -1)
 
-            def make_mask_mod(_q_seg, _k_seg, _causal):
-                def mask_mod(b, h, q_idx, kv_idx):
-                    same_segment = _q_seg[q_idx] == _k_seg[kv_idx]
-                    return same_segment & (q_idx >= kv_idx) if _causal else same_segment
-                return mask_mod
-
-            block_mask = create_block_mask(
-                make_mask_mod(q_segment_ids, k_segment_ids, causal),
-                B=None, H=None, Q_LEN=total_q, KV_LEN=total_k,
-                device=device
+            # q is already pre-scaled by (self.scale / default_scale) if a custom scale
+            # was set; varlen_attn applies its own 1/sqrt(head_dim), giving effective
+            # scale = self.scale — same behaviour as the sdp path.
+            att = varlen_attn(
+                query = rearrange(q, '1 h t d -> t h d'),
+                key   = rearrange(k, '1 h t d -> t h d'),
+                value = rearrange(v, '1 h t d -> t h d'),
+                cu_seq_q = cu_seqlens_q,
+                cu_seq_k = cu_seqlens_k,
+                max_q = max_q,
+                max_k = max_k,
+                window_size = window_size,
             )
-
-            # flex_attention applies its own 1/sqrt(head_dim) scale; q is already
-            # pre-scaled by (self.scale / default_scale) if a custom scale was set,
-            # so the effective scale is self.scale — same behaviour as before.
-            out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=(k.shape[1] < q.shape[1]))
+            out = rearrange(att, 't h d -> 1 h t d')
 
             if self.training and self.dropout > 0.:
                 out = F.dropout(out, p=self.dropout)
