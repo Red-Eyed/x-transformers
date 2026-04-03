@@ -4,25 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-```bash
-# Install
-pip install x-transformers
+Use `uv` exclusively to run Python commands in this project.
 
+```bash
 # Install from source (dev)
-pip install -e .
+uv pip install -e .
 
 # Run all tests
-pytest tests/
+uv run pytest tests/
 
 # Run a single test file
-pytest tests/test_x_transformers.py
+uv run pytest tests/test_x_transformers.py
 
 # Run a specific test
-pytest tests/test_x_transformers.py::test_name
+uv run pytest tests/test_x_transformers.py::test_name
 
 # Training examples (use python-fire CLI)
-python train_enwik8.py
-python train_copy.py
+uv run python3 train_enwik8.py
+uv run python3 train_copy.py
+
+# Run example scripts
+uv run python3 examples/<script>.py
 ```
 
 ## Architecture
